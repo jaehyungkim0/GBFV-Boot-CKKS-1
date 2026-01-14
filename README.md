@@ -1,6 +1,6 @@
 # Instructions
 
-Hello reviewers, this is an anonymous repository for the submission. To execute our implementation, go to examples/singleparty/ckks_bootstrapping/high_precision directory and run main.go. It will then run the GBFV bootstrapping from CKKS.
+To execute our implementation, go to examples/singleparty/ckks_bootstrapping/high_precision directory and run main.go. It will then run the GBFV bootstrapping from CKKS.
 
 # Lattigo: lattice-based multiparty homomorphic encryption library in Go
 
