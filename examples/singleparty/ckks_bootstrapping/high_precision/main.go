@@ -1,5 +1,9 @@
 // GBFV Bootstrapping from CKKS, relying on META-BTS to instantiate high precision CKKS bootstrapping.
 //
+// AI assistance statement:
+// ChatGPT Codex was used to refactor author-written proof-of-concept code.
+// The authors reviewed and approved the resulting code.
+//
 // Use -short to run with smaller insecure parameters, and -once for a quick smoke test.
 package main
 

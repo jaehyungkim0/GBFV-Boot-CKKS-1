@@ -1,5 +1,8 @@
 # Instructions
 
+AI assistance statement: ChatGPT Codex was used to refactor author-written
+proof-of-concept code. The authors reviewed and approved the resulting code.
+
 To execute our implementation, go to examples/singleparty/ckks_bootstrapping/high_precision directory and run main.go. It will then run the GBFV bootstrapping from CKKS.
 
 # Lattigo: lattice-based multiparty homomorphic encryption library in Go
