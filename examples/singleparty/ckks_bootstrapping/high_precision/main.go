@@ -1,14 +1,14 @@
-// GBFV Bootstrapping from CKKS, relying on META-BTS to instantiate high precision CKKS bootstrapping
-
-// Use the flag -short to run the examples fast but with insecure parameters.
+// GBFV Bootstrapping from CKKS, relying on META-BTS to instantiate high precision CKKS bootstrapping.
+//
+// Use -short to run with smaller insecure parameters, and -once for a quick smoke test.
 package main
 
 import (
+	"crypto/rand"
 	"flag"
 	"fmt"
 	"math"
 	"math/big"
-	"crypto/rand"
 	"time"
 
 	"github.com/tuneinsight/lattigo/v6/circuits/ckks/bootstrapping"
@@ -21,118 +21,121 @@ import (
 )
 
 var flagShort = flag.Bool("short", false, "run the example with a smaller and insecure ring degree.")
+var flagOnce = flag.Bool("once", false, "run only one experiment iteration.")
+
+const (
+	defaultLogN           = 16
+	shortLogNDelta        = 3
+	defaultIterations     = 20
+	gbfvBase              = int64(16)
+	gbfvSlots             = int64(128)
+	perturbationMagnitude = 1e-9
+)
+
+type bootstrappingSetup struct {
+	params    ckks.Parameters
+	btpParams bootstrapping.Parameters
+}
+
+type schemeContext struct {
+	encoder   *ckks.Encoder
+	encryptor *rlwe.Encryptor
+	decryptor *rlwe.Decryptor
+	evaluator *bootstrapping.Evaluator
+}
+
+type gbfvParameters struct {
+	base            int64
+	slots           int64
+	ringDegree      int64
+	baseInt         *big.Int
+	upperBound      *big.Int
+	upperBoundFloat *big.Float
+	q               *big.Int
+	qPrime          *big.Int
+	qFloat          *big.Float
+	qPrimeFloat     *big.Float
+	oneFloat        *big.Float
+	precision       uint
+}
 
 func main() {
-
 	flag.Parse()
 
-	// Default LogN, which with the following defined parameters
-	// provides a security of 128-bit.
-	LogN := 16
-
+	logN := defaultLogN
 	if *flagShort {
-		LogN -= 3
+		logN -= shortLogNDelta
 	}
 
-	//==============================
-	//=== 1) RESIDUAL PARAMETERS ===
-	//==============================
-
-	// First we must define the residual parameters.
-	// The residual parameters are the parameters used outside of the bootstrapping circuit.
-	// For this example, we have a LogN=16, logQ = (55+45) + 5*(45+45) and logP = 3*61, so LogQP = 638.
-	// With LogN=16, LogQP=638 and H=192, these parameters achieve well over 128-bit of security.
-	params, err := ckks.NewParametersFromLiteral(ckks.ParametersLiteral{
-		LogN:            LogN,              // Log2 of the ring degree
-		LogQ:            []int{60, 45, 45, 45},     // Log2 of the ciphertext prime moduli
-		LogP:            []int{61, 61, 61, 61}, // Log2 of the key-switch auxiliary prime moduli
-		LogDefaultScale: 90,                // Log2 of the scale
-		Xs:              ring.Ternary{H: 192},
-	})
-
+	setup, err := newBootstrappingSetup(logN)
 	if err != nil {
 		panic(err)
 	}
 
-	prec := params.EncodingPrecision()
+	printBootstrappingParameters(setup.btpParams)
 
-	//==========================================
-	//=== 2) BOOTSTRAPPING PARAMETERSLITERAL ===
-	//==========================================
+	ctx, err := newSchemeContext(setup.params, setup.btpParams)
+	if err != nil {
+		panic(err)
+	}
 
-	// The bootstrapping circuit use its own Parameters which will be automatically
-	// instantiated given the residual parameters and the bootstrapping parameters.
+	gbfv := newGBFVParameters(setup.params, logN)
+	printGBFVParameters(gbfv)
 
-	// !WARNING! The bootstrapping parameters are not ensure to be 128-bit secure, it is the
-	// responsibility of the user to check that the meet the security requirement and tweak them if necessary.
+	runExperiment(setup.params, ctx, gbfv)
+}
 
-	// Note that the default bootstrapping parameters use LogN=16 and a ternary secret with H=192 non-zero coefficients
-	// which provides parameters which are at least 128-bit if their LogQP <= 1550.
+func newBootstrappingSetup(logN int) (bootstrappingSetup, error) {
+	params, err := newResidualParameters(logN)
+	if err != nil {
+		return bootstrappingSetup{}, err
+	}
 
-	// For this first example, we do not specify any circuit specific optional field in the bootstrapping parameters literal.
-	// Thus we expect the bootstrapping to give an average precision of 27.9 bits with H=192 (and 24.4 with H=N/2)
-	// if the plaintext values are uniformly distributed in [-1, 1] for both the real and imaginary part.
-	// See `circuits/bootstrapping/parameters_literal.go` for detailed information about the optional fields.
-	btpParametersLit := bootstrapping.ParametersLiteral{
-		// We specify LogN to ensure that both the residual parameters and the bootstrapping parameters
-		// have the same LogN. This is not required, but we want it for this example.
-		LogN: utils.Pointy(LogN),
+	btpParams, err := newBootstrappingParameters(params, logN)
+	if err != nil {
+		return bootstrappingSetup{}, err
+	}
 
-		// In this example we need manually specify the number of auxiliary primes (i.e. #Pi) used by the
-		// evaluation keys of the bootstrapping circuit, so that the size of LogQP  meets the security target.
+	if *flagShort {
+		// Corrects Q0/|m(X)| for the smaller number of slots while keeping the same precision target.
+		btpParams.Mod1ParametersLiteral.LogMessageRatio += defaultLogN - params.LogN()
+	}
+
+	return bootstrappingSetup{params: params, btpParams: btpParams}, nil
+}
+
+func newResidualParameters(logN int) (ckks.Parameters, error) {
+	return ckks.NewParametersFromLiteral(ckks.ParametersLiteral{
+		LogN:            logN,
+		LogQ:            []int{60, 45, 45, 45},
+		LogP:            []int{61, 61, 61, 61},
+		LogDefaultScale: 90,
+		Xs:              ring.Ternary{H: 192},
+	})
+}
+
+func newBootstrappingParameters(params ckks.Parameters, logN int) (bootstrapping.Parameters, error) {
+	return bootstrapping.NewParametersFromLiteral(params, bootstrapping.ParametersLiteral{
+		LogN: utils.Pointy(logN),
 		LogP: []int{61, 61, 61, 61},
-
-		// Sets the IterationsParameters.
-		// The default bootstrapping parameters have 27.9 bits of average precision and
-		// ~25 bits of minimum precision, and the maximum precision that can be theoretically
-		// achieved is LogScale - LogN/2.
-		// Therefore we start with 27.9 bits and each can in theory increase the precision an additional 25 bits.
-		// However, to achieve the best possible precision, we must carefully adjust each iteration by hand so
-		// that the sum of all the minimum precision is as close as possible
-		// to LogScale - LogN/2. Here 27.9+25+25+5 ~= 82.5 (for the insecure parameters with LogN=13, with
-		// the secure parameters using LogN=16 achieve 82.5 - (16-13)/2 = 81 bits of precision).
 		IterationsParameters: &bootstrapping.IterationsParameters{
 			BootstrappingPrecision: []float64{25, 25, 5},
 			ReservedPrimeBitSize:   28,
 		},
-
-		// In this example we manually specify the bootstrapping parameters' secret distribution.
-		// This is not necessary, but we ensure here that they are the same as the residual parameters.
 		Xs: params.Xs(),
-	}
+	})
+}
 
-	//===================================
-	//=== 3) BOOTSTRAPPING PARAMETERS ===
-	//===================================
-
-	// Now that the residual parameters and the bootstrapping parameters literals are defined, we can instantiate
-	// the bootstrapping parameters.
-	// The instantiated bootstrapping parameters store their own ckks.Parameter, which are the parameters of the
-	// ring used by the bootstrapping circuit.
-	// The bootstrapping parameters are a wrapper of ckks.Parameters, with additional information.
-	// They therefore has the same API as the ckks.Parameters and we can use this API to print some information.
-	btpParams, err := bootstrapping.NewParametersFromLiteral(params, btpParametersLit)
-	if err != nil {
-		panic(err)
-	}
-
-	if *flagShort {
-		// Corrects the message ratio Q0/|m(X)| to take into account the smaller number of slots and keep the same precision
-		btpParams.Mod1ParametersLiteral.LogMessageRatio += 16 - params.LogN()
-	}
-
-	// We print some information about the residual parameters.
+func printBootstrappingParameters(btpParams bootstrapping.Parameters) {
 	fmt.Printf("Residual parameters: logN=%d, logSlots=%d, H=%d, sigma=%f, logQP=%f, levels=%d, scale=2^%d\n",
 		btpParams.ResidualParameters.LogN(),
 		btpParams.ResidualParameters.LogMaxSlots(),
 		btpParams.ResidualParameters.XsHammingWeight(),
-		btpParams.ResidualParameters.Xe(), params.LogQP(),
+		btpParams.ResidualParameters.Xe(),
+		btpParams.ResidualParameters.LogQP(),
 		btpParams.ResidualParameters.MaxLevel(),
 		btpParams.ResidualParameters.LogDefaultScale())
 
-	// And some information about the bootstrapping parameters.
-	// We can notably check that the LogQP of the bootstrapping parameters is smaller than 1550, which ensures
-	// 128-bit of security as explained above.
 	fmt.Printf("Bootstrapping parameters: logN=%d, logSlots=%d, H(%d; %d), sigma=%f, logQP=%f, levels=%d, scale=2^%d\n",
 		btpParams.BootstrappingParameters.LogN(),
 		btpParams.BootstrappingParameters.LogMaxSlots(),
@@ -142,17 +145,10 @@ func main() {
 		btpParams.BootstrappingParameters.LogQP(),
 		btpParams.BootstrappingParameters.QCount(),
 		btpParams.BootstrappingParameters.LogDefaultScale())
+}
 
-	//===========================
-	//=== 4) KEYGEN & ENCRYPT ===
-	//===========================
-
-	// Now that both the residual and bootstrapping parameters are instantiated, we can
-	// instantiate the usual necessary object to encode, encrypt and decrypt.
-
-	// Scheme context and keys
+func newSchemeContext(params ckks.Parameters, btpParams bootstrapping.Parameters) (schemeContext, error) {
 	kgen := rlwe.NewKeyGenerator(params)
-
 	sk, pk := kgen.GenKeyPairNew()
 
 	encoder := ckks.NewEncoder(params)
@@ -163,209 +159,279 @@ func main() {
 	fmt.Println("Generating bootstrapping evaluation keys...")
 	evk, _, err := btpParams.GenEvaluationKeys(sk)
 	if err != nil {
-		panic(err)
+		return schemeContext{}, err
 	}
 	fmt.Println("Done")
 
-	//========================
-	//=== 5) BOOTSTRAPPING ===
-	//========================
-
-	// Instantiates the bootstrapper
-	var eval *bootstrapping.Evaluator
-	if eval, err = bootstrapping.NewEvaluator(btpParams, evk); err != nil {
-		panic(err)
+	evaluator, err := bootstrapping.NewEvaluator(btpParams, evk)
+	if err != nil {
+		return schemeContext{}, err
 	}
-	
-	// Paramters
-	// We are using t(X) = X^k - b over Z[X]/(X^N+1)
-	ringQ := params.RingQ().AtLevel(params.LevelsConsumedPerRescaling()-1)
-	Q := ringQ.ModulusAtLevel[params.LevelsConsumedPerRescaling()-1]
-	Qprime := new(big.Int).Div(ringQ.ModulusAtLevel[2 * params.LevelsConsumedPerRescaling() - 1], Q)
-	fmt.Println("Q = ", Q)
-	f := new(big.Float).SetPrec(prec)
-	f.SetInt(Q)
-	fprime := new(big.Float).SetPrec(prec)
-	fprime.SetInt(Qprime)
-	b := int64(256)
-	bbig := big.NewInt(b)
-	k := int64(1)
-	N := (int64)(1 << LogN)
-	one := new(big.Float).SetPrec(prec)
-	one.SetInt(big.NewInt(1))
-	// Compute b^{N/k}
-	upperBound := new(big.Int).Exp(bbig, big.NewInt(N/k), nil)
 
-        // Add 1: upperBound = b^{N/k} + 1
-        upperBound.Add(upperBound, big.NewInt(1))
-	upperBoundFloat := new(big.Float).SetPrec(prec)
-	upperBoundFloat.SetInt(upperBound)
+	return schemeContext{
+		encoder:   encoder,
+		encryptor: encryptor,
+		decryptor: decryptor,
+		evaluator: evaluator,
+	}, nil
+}
 
-	fmt.Printf("GBFV Bootstrapping Parameters: b = %d, k = %d\n", b, k) 
+func newGBFVParameters(params ckks.Parameters, logN int) gbfvParameters {
+	precision := params.EncodingPrecision()
+	ringDegree := int64(1) << logN
+	baseInt := big.NewInt(gbfvBase)
 
+	upperBound := new(big.Int).Exp(baseInt, big.NewInt(ringDegree/gbfvSlots), nil)
+	upperBound.Add(upperBound, big.NewInt(1))
 
+	ringQ := params.RingQ().AtLevel(params.LevelsConsumedPerRescaling() - 1)
+	q := new(big.Int).Set(ringQ.ModulusAtLevel[params.LevelsConsumedPerRescaling()-1])
+	qPrime := new(big.Int).Div(new(big.Int).Set(ringQ.ModulusAtLevel[2*params.LevelsConsumedPerRescaling()-1]), q)
+
+	return gbfvParameters{
+		base:            gbfvBase,
+		slots:           gbfvSlots,
+		ringDegree:      ringDegree,
+		baseInt:         baseInt,
+		upperBound:      upperBound,
+		upperBoundFloat: new(big.Float).SetPrec(precision).SetInt(upperBound),
+		q:               q,
+		qPrime:          qPrime,
+		qFloat:          new(big.Float).SetPrec(precision).SetInt(q),
+		qPrimeFloat:     new(big.Float).SetPrec(precision).SetInt(qPrime),
+		oneFloat:        new(big.Float).SetPrec(precision).SetInt64(1),
+		precision:       precision,
+	}
+}
+
+func printGBFVParameters(gbfv gbfvParameters) {
+	fmt.Println("Q = ", gbfv.q)
+	fmt.Printf("GBFV Bootstrapping Parameters: b = %d, k = %d, log2(b^(N/k)) = %.2f\n",
+		gbfv.base,
+		gbfv.slots,
+		plaintextPrecisionBits(gbfv))
+}
+
+func plaintextPrecisionBits(gbfv gbfvParameters) float64 {
+	return float64(gbfv.ringDegree/gbfv.slots) * math.Log2(float64(gbfv.base))
+}
+
+func runExperiment(params ckks.Parameters, ctx schemeContext, gbfv gbfvParameters) {
+	iterations := iterationCount()
 	var totalDuration time.Duration
-	num_iter := 20
 
-	for iter := 0; iter < num_iter; iter++ {
-	fmt.Println("-----------------------------------------------------")
-	fmt.Printf("------------------ Iteration %d ----------------------\n", iter)
-	fmt.Println("-----------------------------------------------------")
+	for iter := 0; iter < iterations; iter++ {
+		fmt.Println("-----------------------------------------------------")
+		fmt.Printf("------------------ Iteration %d ----------------------\n", iter)
+		fmt.Println("-----------------------------------------------------")
 
-        // Generate k random integer in [0, b^{N/k} + 1)
-	randInts := make([]*big.Int, k)
-	for i := range randInts {
-        	randInts[i], err = rand.Int(rand.Reader, upperBound)
-        	if err != nil {
-        		panic(err)
-        	}
+		duration := runIteration(params, ctx, gbfv, iter)
+		totalDuration += duration
 	}
 
-	valuesWant := make([]*big.Float, N)
+	fmt.Println("-------------------------------------------------------------------")
+	fmt.Println("Average Bootstrapping Time:", totalDuration/time.Duration(iterations))
+}
 
-	// Generate a corresponding GBFV ciphertext
-	for i := range valuesWant {
-		valuesWant[i] = new(big.Float).SetPrec(prec)
-		idx := int64(i) % k
-		j := int64(i) / k
-		Nmj := big.NewInt(N/k-int64(j)-1)
-		bint := new(big.Int).Exp(bbig, Nmj, nil)
-		bint = new(big.Int).Mul(bint, randInts[idx]) // multiply by random integer in [0, b^{N/k}+1)
-		bint = new(big.Int).Mod(bint, upperBound) // modular reduce by b^{N/k}+1
-		bi := new(big.Float).SetPrec(prec)
-		bi.SetInt(bint)
-		bi.Quo(bi, upperBoundFloat)
-		valuesWant[i].Mul(bi, f)
+func iterationCount() int {
+	if *flagOnce {
+		return 1
 	}
+	return defaultIterations
+}
 
-	valuesWantPert := make([]*big.Float, N)
-
-	// Providing perturbations to generate error	
-	for i := range valuesWantPert {
-		pert := bignum.NewFloat(sampling.RandFloat64(-0.000000001, 0.000000001), prec)
-		pert.Mul(pert, f)
-		valuesWantPert[i] = new(big.Float).SetPrec(prec)
-		valuesWantPert[i].Add(valuesWant[i], pert)
-	}
-
-	for i := range valuesWant {
-		valuesWant[i].Quo(valuesWant[i], f)
-	}
-
-	// Polynomial -q'/t(X) 
-	valuesMult := make([]*big.Float, N)
-	for i := range valuesMult {
-		valuesMult[i] = new(big.Float).SetPrec(prec)
-		if (int64(i) % k == 0) {
-			j := int64(i) / k
-			Nmj := big.NewInt(N/k-int64(j)-1)
-			bint := new(big.Int).Exp(bbig, Nmj, nil)
-			bi := new(big.Float).SetPrec(prec)
-			bi.SetInt(bint)
-			bi.Quo(bi, upperBoundFloat)
-			valuesMult[i].Mul(bi, fprime)
-		} else {
-			valuesMult[i].SetInt(big.NewInt(0))
-		}
-	}
-
-	// Polynomial -t(X) = b - X^k
-	vecpoly := make([]float64, N)
-	for i := range vecpoly {
-		if i == 0 {
-			vecpoly[i] = float64(b)
-		} else if int64(i) == k {
-			vecpoly[i] = -1.0
-		} else {
-			vecpoly[i] = 0.0
-		}
-	}
-
-	// We encrypt at level=LevelsConsumedPerRescaling-1
-	plaintext := ckks.NewPlaintext(params, params.LevelsConsumedPerRescaling()-1)
-	plaintext.IsBatched = false
-	if err := encoder.EncodePoly(valuesWantPert, plaintext); err != nil {
+func runIteration(params ckks.Parameters, ctx schemeContext, gbfv gbfvParameters, iter int) time.Duration {
+	randomInts, err := sampleRandomInts(gbfv)
+	if err != nil {
 		panic(err)
 	}
 
-	pt_mul := ckks.NewPlaintext(params, params.LevelsConsumedPerRescaling()-1)
-	pt_mul.IsBatched = false
-	if err := encoder.EncodePoly(vecpoly, pt_mul); err != nil {
+	valuesScaled := gbfvCoefficientValues(randomInts, gbfv)
+	valuesWant := normalizeByQ(valuesScaled, gbfv)
+	valuesPerturbed := perturbValues(valuesScaled, gbfv)
+
+	plaintext, ptT, ptInverseT, err := encodePlaintexts(params, ctx.encoder, gbfv, valuesPerturbed)
+	if err != nil {
 		panic(err)
 	}
-	pt_mul.Scale = rlwe.NewScale(one);
 
-	plaintextMult := ckks.NewPlaintext(params, 2 * params.LevelsConsumedPerRescaling()-1)
-	plaintextMult.IsBatched = false
-	if err := encoder.EncodePoly(valuesMult, plaintextMult); err != nil {
-		panic(err)
-	}
-	plaintextMult.Scale = rlwe.NewScale(Qprime)
-
-	// Encrypt
-	ciphertext1, err := encryptor.EncryptNew(plaintext)
+	ciphertext, err := ctx.encryptor.EncryptNew(plaintext)
 	if err != nil {
 		panic(err)
 	}
 
 	start := time.Now()
-	// Multiply -t(X)
-	ciphertext3, err := eval.MulNew(ciphertext1, pt_mul)
-	ciphertextSub := ciphertext1.CopyNew()
-
-	ciphertext1.Scale = rlwe.NewScale(f)
-
-	// CKKS-Bootstrap the ciphertext 
-	fmt.Println("Bootstrapping...")
-	ciphertext2, err := eval.Bootstrap(ciphertext3)
-
-	// Multiply -q'/t(X)
-	ciphertext2, err = eval.MulNew(ciphertext2, plaintextMult)
-	err = eval.Rescale(ciphertext2, ciphertext2)
-	err = eval.Rescale(ciphertext2, ciphertext2)
-
-	// Subtraction Step	
-	ciphertext2, err = eval.SubNew(ciphertextSub, ciphertext2)
-
-	elapsed := time.Since(start) // measure elapsed time
-	totalDuration += elapsed
-	fmt.Printf("GBFV Bootstrapping Time (iteration %d): %s\n", iter, elapsed)
-
-	ciphertext2.Scale = rlwe.NewScale(f)
-
+	ciphertextBefore, ciphertextAfter, err := bootstrapGBFV(ctx.evaluator, ciphertext, ptT, ptInverseT, gbfv)
 	if err != nil {
 		panic(err)
 	}
+	elapsed := time.Since(start)
+
+	fmt.Printf("GBFV Bootstrapping Time (iteration %d): %s\n", iter, elapsed)
 	fmt.Println("Done")
 
-	//==================
-	//=== 6) DECRYPT ===
-	//==================
-
-	// Decrypt, print and compare with the plaintext values
 	fmt.Println()
 	fmt.Println("Precision of values vs. ciphertext")
-	printDebug(params, ciphertext1, valuesWant, decryptor, encoder)
-	// Decrypt, print and compare with the plaintext values
+	printDebug(params, ciphertextBefore, valuesWant, ctx.decryptor, ctx.encoder)
+
 	fmt.Println()
 	fmt.Println("Precision of ciphertext vs. Bootstrap(ciphertext)")
-	printDebug(params, ciphertext2, valuesWant, decryptor, encoder)
+	printDebug(params, ciphertextAfter, valuesWant, ctx.decryptor, ctx.encoder)
 
-	} // end iteration for loop
-	fmt.Println("-------------------------------------------------------------------")
-	average := totalDuration / time.Duration(num_iter)
-	fmt.Println("Average Bootstrapping Time:", average)
+	return elapsed
+}
+
+func sampleRandomInts(gbfv gbfvParameters) ([]*big.Int, error) {
+	randomInts := make([]*big.Int, gbfv.slots)
+	for i := range randomInts {
+		value, err := rand.Int(rand.Reader, gbfv.upperBound)
+		if err != nil {
+			return nil, err
+		}
+		randomInts[i] = value
+	}
+	return randomInts, nil
+}
+
+func gbfvCoefficientValues(randomInts []*big.Int, gbfv gbfvParameters) []*big.Float {
+	values := make([]*big.Float, gbfv.ringDegree)
+	for i := range values {
+		idx := int64(i) % gbfv.slots
+		block := int64(i) / gbfv.slots
+		exponent := big.NewInt(gbfv.ringDegree/gbfv.slots - block - 1)
+
+		coefficient := new(big.Int).Exp(gbfv.baseInt, exponent, nil)
+		coefficient.Mul(coefficient, randomInts[idx])
+		coefficient.Mod(coefficient, gbfv.upperBound)
+
+		unit := new(big.Float).SetPrec(gbfv.precision).SetInt(coefficient)
+		unit.Quo(unit, gbfv.upperBoundFloat)
+
+		values[i] = new(big.Float).SetPrec(gbfv.precision).Mul(unit, gbfv.qFloat)
+	}
+	return values
+}
+
+func normalizeByQ(values []*big.Float, gbfv gbfvParameters) []*big.Float {
+	normalized := make([]*big.Float, len(values))
+	for i, value := range values {
+		normalized[i] = new(big.Float).SetPrec(gbfv.precision).Quo(value, gbfv.qFloat)
+	}
+	return normalized
+}
+
+func perturbValues(values []*big.Float, gbfv gbfvParameters) []*big.Float {
+	perturbed := make([]*big.Float, len(values))
+	for i, value := range values {
+		perturbation := bignum.NewFloat(sampling.RandFloat64(-perturbationMagnitude, perturbationMagnitude), gbfv.precision)
+		perturbation.Mul(perturbation, gbfv.qFloat)
+
+		perturbed[i] = new(big.Float).SetPrec(gbfv.precision).Add(value, perturbation)
+	}
+	return perturbed
+}
+
+func inverseTMultiplierValues(gbfv gbfvParameters) []*big.Float {
+	values := make([]*big.Float, gbfv.ringDegree)
+	for i := range values {
+		values[i] = new(big.Float).SetPrec(gbfv.precision)
+		if int64(i)%gbfv.slots != 0 {
+			continue
+		}
+
+		block := int64(i) / gbfv.slots
+		exponent := big.NewInt(gbfv.ringDegree/gbfv.slots - block - 1)
+
+		coefficient := new(big.Int).Exp(gbfv.baseInt, exponent, nil)
+		unit := new(big.Float).SetPrec(gbfv.precision).SetInt(coefficient)
+		unit.Quo(unit, gbfv.upperBoundFloat)
+
+		values[i].Mul(unit, gbfv.qPrimeFloat)
+	}
+	return values
+}
+
+func tPolynomialBigFloat(size int, gbfv gbfvParameters) []*big.Float {
+	values := make([]*big.Float, size)
+	for i := range values {
+		values[i] = new(big.Float).SetPrec(gbfv.precision)
+	}
+	values[0].SetInt64(gbfv.base)
+	values[gbfv.slots].SetInt64(-1)
+	return values
+}
+
+func encodePlaintexts(params ckks.Parameters, encoder *ckks.Encoder, gbfv gbfvParameters, values []*big.Float) (plaintext, ptT, ptInverseT *rlwe.Plaintext, err error) {
+	inputLevel := params.LevelsConsumedPerRescaling() - 1
+	inverseTLevel := 2*params.LevelsConsumedPerRescaling() - 1
+
+	plaintext = ckks.NewPlaintext(params, inputLevel)
+	plaintext.IsBatched = false
+	if err = encoder.EncodePoly(values, plaintext); err != nil {
+		return nil, nil, nil, err
+	}
+
+	ptT = ckks.NewPlaintext(params, inputLevel)
+	ptT.IsBatched = false
+	if err = encoder.EncodePoly(tPolynomialBigFloat(int(gbfv.ringDegree), gbfv), ptT); err != nil {
+		return nil, nil, nil, err
+	}
+	ptT.Scale = rlwe.NewScale(gbfv.oneFloat)
+
+	ptInverseT = ckks.NewPlaintext(params, inverseTLevel)
+	ptInverseT.IsBatched = false
+	if err = encoder.EncodePoly(inverseTMultiplierValues(gbfv), ptInverseT); err != nil {
+		return nil, nil, nil, err
+	}
+	ptInverseT.Scale = rlwe.NewScale(gbfv.qPrime)
+
+	return plaintext, ptT, ptInverseT, nil
+}
+
+func bootstrapGBFV(eval *bootstrapping.Evaluator, ciphertext *rlwe.Ciphertext, ptT, ptInverseT *rlwe.Plaintext, gbfv gbfvParameters) (ciphertextBefore, ciphertextAfter *rlwe.Ciphertext, err error) {
+	ctTimesT, err := eval.MulNew(ciphertext, ptT)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	ciphertextSub := ciphertext.CopyNew()
+	ciphertext.Scale = rlwe.NewScale(gbfv.qFloat)
+
+	fmt.Println("Bootstrapping...")
+	bootstrapped, err := eval.Bootstrap(ctTimesT)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	correction, err := eval.MulNew(bootstrapped, ptInverseT)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err = eval.Rescale(correction, correction); err != nil {
+		return nil, nil, err
+	}
+	if err = eval.Rescale(correction, correction); err != nil {
+		return nil, nil, err
+	}
+
+	ciphertextAfter, err = eval.SubNew(ciphertextSub, correction)
+	if err != nil {
+		return nil, nil, err
+	}
+	ciphertextAfter.Scale = rlwe.NewScale(gbfv.qFloat)
+
+	return ciphertext, ciphertextAfter, nil
 }
 
 func printDebug(params ckks.Parameters, ciphertext *rlwe.Ciphertext, valuesWant []*big.Float, decryptor *rlwe.Decryptor, encoder *ckks.Encoder) (valuesTest []*big.Float) {
 	prec := params.EncodingPrecision()
-	valuesTest = make([]*big.Float, 1 << params.LogN())
-	valuesWant2 := make([]*big.Float, 1 << params.LogN())
-	one := new(big.Float).SetPrec(prec)
-	one.SetInt(big.NewInt(1))
+	valuesTest = make([]*big.Float, params.N())
+	valuesWantAdjusted := make([]*big.Float, params.N())
+	one := new(big.Float).SetPrec(prec).SetInt64(1)
+
 	for i := range valuesTest {
 		valuesTest[i] = new(big.Float).SetPrec(prec)
-		valuesWant2[i] = new(big.Float).SetPrec(prec)
+		valuesWantAdjusted[i] = new(big.Float).SetPrec(prec)
 	}
 
 	if err := encoder.Decode(decryptor.DecryptNew(ciphertext), valuesTest); err != nil {
@@ -373,30 +439,33 @@ func printDebug(params ckks.Parameters, ciphertext *rlwe.Ciphertext, valuesWant 
 	}
 
 	for i := range valuesTest {
-		temp := new(big.Float).SetPrec(prec)
-		temp.Sub(valuesTest[i], valuesWant[i])
-		
-		if temp.Cmp(big.NewFloat(0.5)) == 1 {
-			valuesWant2[i].Add(valuesWant[i], one)
-		} else if temp.Cmp(big.NewFloat(-0.5)) == -1 {
-			valuesTest[i].Add(valuesTest[i], one)
-			valuesWant2[i] = valuesWant[i]
-		} else {
-			valuesWant2[i] = valuesWant[i]
-		}
+		valuesTest[i], valuesWantAdjusted[i] = adjustUnitWrap(valuesTest[i], valuesWant[i], one, prec)
 	}
 
 	fmt.Println()
 	fmt.Printf("Level: %d (logQ = %d)\n", ciphertext.Level(), params.LogQLvl(ciphertext.Level()))
-
 	fmt.Printf("Scale: 2^%f\n", math.Log2(ciphertext.Scale.Float64()))
 	fmt.Printf("ValuesTest: %6.27f %6.27f...\n", valuesTest[0], valuesTest[1])
-	fmt.Printf("ValuesWant: %6.27f %6.27f...\n", valuesWant[0], valuesWant[1])
+	fmt.Printf("ValuesWant: %6.27f %6.27f...\n", valuesWantAdjusted[0], valuesWantAdjusted[1])
 
-	precStats := ckks.GetPrecisionStats(params, encoder, nil, valuesWant2, valuesTest, 0, false)
-
+	precStats := ckks.GetPrecisionStats(params, encoder, nil, valuesWantAdjusted, valuesTest, 0, false)
 	fmt.Println(precStats.String())
 	fmt.Println()
 
-	return
+	return valuesTest
+}
+
+func adjustUnitWrap(valueTest, valueWant, one *big.Float, precision uint) (adjustedTest, adjustedWant *big.Float) {
+	adjustedTest = new(big.Float).SetPrec(precision).Set(valueTest)
+	adjustedWant = new(big.Float).SetPrec(precision).Set(valueWant)
+
+	diff := new(big.Float).SetPrec(precision).Sub(adjustedTest, adjustedWant)
+	switch {
+	case diff.Cmp(big.NewFloat(0.5)) == 1:
+		adjustedWant.Add(adjustedWant, one)
+	case diff.Cmp(big.NewFloat(-0.5)) == -1:
+		adjustedTest.Add(adjustedTest, one)
+	}
+
+	return adjustedTest, adjustedWant
 }
